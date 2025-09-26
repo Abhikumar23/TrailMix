@@ -11,6 +11,11 @@ const mockChrome = {
     sendMessage: jest.fn(),
     onUpdated: {
       addListener: jest.fn()
+    },
+    
+    onRemoved: { 
+      addListener: jest.fn(),
+      removeListener: jest.fn()
     }
   },
   downloads: {
@@ -31,6 +36,7 @@ global.chrome = mockChrome;
 // Import after setting up mocks
 const DownloadManager = require('../../lib/download-manager.js');
 
+// Main test suite, all other suites must be nested inside this block
 describe('DownloadManager', () => {
   let downloadManager;
   let mockPurchaseItem;
@@ -352,4 +358,146 @@ describe('DownloadManager', () => {
       expect(mockChrome.tabs.remove).toHaveBeenCalled();
     }, 15000);
   });
-});
+  
+
+  describe('Network Failure Tests', () => {
+    test('should handle download URL returning 404', async () => {
+      mockChrome.tabs.create.mockResolvedValue({ id: 123 });
+      mockChrome.downloads.download.mockRejectedValue(new Error('Download failed: The server responded with a 404 Not Found.'));
+
+      await expect(downloadManager.download(mockPurchaseItem)).rejects.toThrow('The server responded with a 404 Not Found');
+
+      expect(mockChrome.tabs.remove).toHaveBeenCalled(); 
+    }, 15000);
+
+    test('should handle download interrupted by network timeout', async () => {
+      mockChrome.tabs.create.mockResolvedValue({ id: 123 });
+      mockChrome.downloads.download.mockRejectedValue(new Error('Download failed: Network timeout.'));
+
+      await expect(downloadManager.download(mockPurchaseItem)).rejects.toThrow('Network timeout');
+
+      expect(mockChrome.tabs.remove).toHaveBeenCalled();
+    }, 15000); 
+  });
+
+  describe('Chrome API Permission Errors', () => {
+    test('should handle missing Chrome Downloads API permission', async () => {
+      const downloadSpy = jest.spyOn(mockChrome.downloads, 'download').mockImplementation(() => {
+        mockChrome.runtime.lastError = { message: 'The "downloads" permission is missing.' };
+        return Promise.reject(new Error('API permission missing'));
+      });
+      mockChrome.tabs.create.mockResolvedValue({ id: 123 });
+
+      await expect(downloadManager.download(mockPurchaseItem)).rejects.toThrow('The "downloads" permission is missing');
+      expect(downloadSpy).toHaveBeenCalled();
+    }, 15000); 
+
+    test('should handle tab creation permission being denied', async () => {
+      mockChrome.tabs.create.mockRejectedValue(new Error('Permissions to create a tab are denied.'));
+
+      await expect(downloadManager.download(mockPurchaseItem)).rejects.toThrow('Permissions to create a tab are denied.');
+      expect(downloadManager.activeDownload).toBeNull();
+    });
+
+    test('should handle sendMessage failing due to permission issues', async () => {
+      mockChrome.tabs.create.mockResolvedValue({ id: 123 });
+      mockChrome.tabs.sendMessage.mockImplementation((tabId, message, callback) => {
+        mockChrome.runtime.lastError = { message: 'Cannot access tab with ID 123.' };
+        callback();
+      });
+      
+      jest.useFakeTimers();
+      const downloadPromise = downloadManager.download(mockPurchaseItem);
+      jest.advanceTimersByTime(2500);
+
+      await expect(downloadPromise).rejects.toThrow('Cannot access tab with ID 123.');
+
+      jest.useRealTimers();
+      expect(mockChrome.tabs.remove).toHaveBeenCalled();
+    }, 15000); 
+  });
+
+  describe('Concurrent Download Attempts', () => {
+    let mockSecondPurchaseItem;
+
+    beforeEach(() => {
+      mockSecondPurchaseItem = {
+        title: 'Second Test Album',
+        artist: 'Second Test Artist',
+        downloadUrl: 'https://bandcamp.com/download/album?id=654321',
+        albumArt: 'https://example.com/artwork2.jpg'
+      };
+      mockChrome.tabs.create.mockResolvedValue({ id: 123 }); 
+    });
+
+    test('should throw an error when a download is already in progress', async () => {
+      downloadManager.activeDownload = {
+        purchaseItem: mockPurchaseItem,
+        status: 'in_progress'
+      };
+      
+      await expect(downloadManager.download(mockSecondPurchaseItem)).rejects.toThrow('A download is already in progress. Please wait for it to complete.');
+      
+      expect(downloadManager.activeDownload).toBeDefined();
+      expect(downloadManager.activeDownload.purchaseItem.title).toBe('Test Album');
+
+      downloadManager.activeDownload = null;
+    });
+
+    test('that the error message is clear and actionable', async () => {
+    
+      downloadManager.activeDownload = { status: 'in_progress' };
+      try {
+        await downloadManager.download(mockSecondPurchaseItem);
+      } catch (e) {
+       
+        expect(e.message).toBe('A download is already in progress. Please wait for it to complete.');
+      }
+      downloadManager.activeDownload = null;
+    });
+  });
+
+  describe('Tab Lifecycle Issues', () => {
+    test('should cancel download when tab is closed by user', async () => {
+      const mockTabId = 123;
+      mockChrome.tabs.create.mockResolvedValue({ id: mockTabId });
+
+      const downloadPromise = downloadManager.download(mockPurchaseItem);
+
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const tabRemovedListener = mockChrome.tabs.onRemoved.addListener.mock.calls[0]?.[0];
+      
+      expect(tabRemovedListener).toBeDefined(); 
+
+      if (tabRemovedListener) {
+        tabRemovedListener(mockTabId);
+      }
+      
+      await expect(downloadPromise).rejects.toThrow('Tab was closed by user');
+      expect(downloadManager.activeDownload).toBeNull();
+    }, 15000); 
+  });
+
+  describe('URL Validation Tests', () => {
+   
+    test('should reject invalid URLs', async () => {
+      const invalidItem = { ...mockPurchaseItem, downloadUrl: 'not-a-valid-url' };
+      await expect(downloadManager.download(invalidItem)).rejects.toThrow('Invalid download URL format');
+      expect(downloadManager.activeDownload).toBeNull();
+    });
+
+    test('should reject non-bcbits.com domains', async () => {
+      const invalidDomainItem = { ...mockPurchaseItem, downloadUrl: 'https://other-site.com/download/album?id=123' };
+      await expect(downloadManager.download(invalidDomainItem)).rejects.toThrow('URL must be from a supported domain: bandcamp.com');
+      expect(downloadManager.activeDownload).toBeNull();
+    });
+
+    test('should reject HTTP (non-HTTPS) URLs', async () => {
+      const httpItem = { ...mockPurchaseItem, downloadUrl: 'http://bandcamp.com/download/album?id=123' };
+      await expect(downloadManager.download(httpItem)).rejects.toThrow('URL must use the HTTPS protocol.');
+      expect(downloadManager.activeDownload).toBeNull();
+    });
+  });
+  
+}); // End of the main DownloadManager describe block
